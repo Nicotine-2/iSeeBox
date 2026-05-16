@@ -278,12 +278,13 @@ PAGECHECK;
 <script type="text/javascript">
 (function() {
     var iseeConfig = {$configJson};
-    var isInitialized = false;
+    var isBound = false;
     
-    function initiSeeBox() {
-        if (isInitialized) return;
+    // 快速绑定灯箱
+    function bindLightbox() {
+        if (isBound) return;
         if (typeof jQuery === 'undefined' || typeof jQuery.fn.iseebox === 'undefined') {
-            setTimeout(initiSeeBox, 100);
+            setTimeout(bindLightbox, 10);
             return;
         }
         
@@ -343,21 +344,157 @@ PAGECHECK;
             
             if (\$links.length > 0) {
                 try {
+                    \$links.off('click.isee');
                     \$links.iseebox(iseeConfig);
-                    isInitialized = true;
-                    if (window.console) console.log('iSeeBox: 初始化完成，共绑定 ' + \$links.length + ' 个图片链接');
+                    isBound = true;
+                    if (window.console) console.log('iSeeBox: 已绑定 ' + \$links.length + ' 个图片');
                 } catch(e) {
-                    if (window.console) console.error('iSeeBox 初始化失败:', e);
+                    if (window.console) console.error('iSeeBox 错误:', e);
                 }
             }
         });
     }
     
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', initiSeeBox);
-    } else {
-        initiSeeBox();
+    // 重新绑定（用于新加载的图片，不限制次数）
+    function rebindLightbox() {
+        if (typeof jQuery === 'undefined' || typeof jQuery.fn.iseebox === 'undefined') {
+            setTimeout(rebindLightbox, 10);
+            return;
+        }
+        
+        jQuery(function($) {
+            {$pageCheck}
+            
+            var autoWrapEnabled = {$autoWrapStr};
+            if (autoWrapEnabled) {
+                var excludeSelectors = {$excludeSelectorsJson};
+                
+                $('.entry-content img, .post-content img, .article-content img, .photo-item img, .photo-grid img').each(function() {
+                    var \$img = $(this);
+                    var src = \$img.attr('src') || \$img.attr('data-src') || \$img.attr('data-original');
+                    
+                    var isExcluded = false;
+                    if (excludeSelectors.length > 0) {
+                        for (var i = 0; i < excludeSelectors.length; i++) {
+                            if (excludeSelectors[i] && \$img.closest(excludeSelectors[i]).length > 0) {
+                                isExcluded = true;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (!isExcluded && \$img.parent('a').length === 0 && src) {
+                        if (src.match(/\\.(jpg|jpeg|png|gif|webp|bmp|svg)/i)) {
+                            var imgAlt = \$img.attr('alt') || '';
+                            \$img.wrap('<a href="' + src + '" title="' + imgAlt + '" class="isee-auto-link"></a>');
+                        }
+                    }
+                });
+            }
+            
+            var selectorStr = "{$selectors}, .isee-auto-link, .photo-item a, .photo-grid a";
+            var \$links = $(selectorStr);
+            
+            var excludeSelectors = {$excludeSelectorsJson};
+            if (excludeSelectors.length > 0) {
+                \$links = \$links.filter(function() {
+                    var \$this = $(this);
+                    for (var i = 0; i < excludeSelectors.length; i++) {
+                        if (excludeSelectors[i] && (\$this.closest(excludeSelectors[i]).length > 0 || \$this.parents(excludeSelectors[i]).length > 0)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                });
+            }
+            
+            \$links = \$links.filter(function() {
+                var \$this = $(this);
+                var hasAlbumClass = \$this.hasClass('album-card-link') || 
+                                   \$this.closest('.album-card-link').length > 0 ||
+                                   \$this.parents('.album-card-link').length > 0;
+                return !hasAlbumClass;
+            });
+            
+            if (\$links.length > 0) {
+                try {
+                    // 只绑定未绑定的链接
+                    \$links.each(function() {
+                        var \$link = $(this);
+                        if (!\$link.data('isee-bound')) {
+                            \$link.data('isee-bound', true);
+                            \$link.off('click.isee');
+                            \$link.iseebox(iseeConfig);
+                        }
+                    });
+                } catch(e) {
+                    if (window.console) console.error('iSeeBox 绑定错误:', e);
+                }
+            }
+        });
     }
+    
+    // 立即绑定已存在的图片
+    bindLightbox();
+    
+    // 为所有未加载完成的图片添加加载监听
+    var quickBind = function() {
+        rebindLightbox();
+    };
+    
+    var images = document.querySelectorAll('img');
+    for (var i = 0; i < images.length; i++) {
+        var img = images[i];
+        if (!img.complete) {
+            img.addEventListener('load', quickBind);
+            img.addEventListener('error', quickBind);
+        }
+    }
+    
+    // 监听新添加的图片（MutationObserver - 瀑布流无限加载）
+    var observer = new MutationObserver(function(mutations) {
+        var needRebind = false;
+        for (var i = 0; i < mutations.length; i++) {
+            var mutation = mutations[i];
+            if (mutation.addedNodes.length > 0) {
+                // 检查新增节点中是否包含图片
+                for (var j = 0; j < mutation.addedNodes.length; j++) {
+                    var node = mutation.addedNodes[j];
+                    if (node.nodeType === 1) { // 元素节点
+                        if (node.tagName === 'IMG' || node.querySelectorAll) {
+                            var hasImg = node.tagName === 'IMG' || node.querySelectorAll('img').length > 0;
+                            if (hasImg) {
+                                needRebind = true;
+                                // 为新图片添加加载监听
+                                var newImages = node.tagName === 'IMG' ? [node] : node.querySelectorAll('img');
+                                for (var k = 0; k < newImages.length; k++) {
+                                    var newImg = newImages[k];
+                                    if (!newImg.complete) {
+                                        newImg.addEventListener('load', quickBind);
+                                        newImg.addEventListener('error', quickBind);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (needRebind) break;
+        }
+        if (needRebind) {
+            rebindLightbox();
+        }
+    });
+    
+    if (document.body) {
+        observer.observe(document.body, { childList: true, subtree: true });
+    } else {
+        document.addEventListener('DOMContentLoaded', function() {
+            observer.observe(document.body, { childList: true, subtree: true });
+        });
+    }
+    
 })();
 </script>
 JS;
