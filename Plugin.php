@@ -1,7 +1,6 @@
 <?php
 /**
  * 精致小巧的灯箱 for Typecho 1.3
- * 
  * @package iSeeBox
  * @author Nicotine-2
  * @version 1.0.0
@@ -15,7 +14,7 @@ class iSeeBox_Plugin implements Typecho_Plugin_Interface
     public static function activate()
     {
         Typecho_Plugin::factory('Widget_Archive')->footer = array('iSeeBox_Plugin', 'renderFooter');
-        return _t('插件已激活，已添加瀑布流相册支持。');
+        return _t('插件已激活，已添加瀑布流相册支持（优化版）。');
     }
     
     public static function deactivate()
@@ -172,15 +171,16 @@ class iSeeBox_Plugin implements Typecho_Plugin_Interface
         $jquerySelect = new Typecho_Widget_Helper_Form_Element_Radio(
             'jquerySelect',
             array(
-                'true' => _t('加载'),
-                'false' => _t('不加载（主题已包含）')
+                'local' => _t('加载本地jQuery（推荐）'),
+                'cdn' => _t('加载CDN jQuery'),
+                'none' => _t('不加载（主题已包含）')
             ),
-            'true',
+            'local',
             _t('加载 jQuery 库')
         );
         $form->addInput($jquerySelect);
         
-        // jQuery 版本
+        // jQuery 版本（当选择CDN时显示）
         $jqueryVersion = new Typecho_Widget_Helper_Form_Element_Select(
             'jqueryVersion',
             array(
@@ -189,9 +189,30 @@ class iSeeBox_Plugin implements Typecho_Plugin_Interface
                 '3.5.1' => 'jQuery 3.5.1'
             ),
             '3.7.1',
-            _t('jQuery 版本')
+            _t('CDN jQuery 版本（仅在选择CDN时生效）')
         );
         $form->addInput($jqueryVersion);
+        
+        // 优化选项
+        $debounceDelay = new Typecho_Widget_Helper_Form_Element_Text(
+            'debounceDelay',
+            NULL,
+            '300',
+            _t('防抖延迟(ms)'),
+            _t('防止频繁触发绑定，单位毫秒，默认300ms')
+        );
+        $debounceDelay->input->setAttribute('class', 'mini');
+        $form->addInput($debounceDelay->addRule('isInteger', _t('请输入数字')));
+        
+        $batchProcessLimit = new Typecho_Widget_Helper_Form_Element_Text(
+            'batchProcessLimit',
+            NULL,
+            '50',
+            _t('批量处理限制'),
+            _t('单次处理的最大图片数量，避免长时间阻塞主线程，默认50张')
+        );
+        $batchProcessLimit->input->setAttribute('class', 'mini');
+        $form->addInput($batchProcessLimit->addRule('isInteger', _t('请输入数字')));
     }
     
     public static function personalConfig(Typecho_Widget_Helper_Form $form)
@@ -208,11 +229,17 @@ class iSeeBox_Plugin implements Typecho_Plugin_Interface
         
         $output[] = '<link rel="stylesheet" type="text/css" href="' . $pluginUrl . 'css/iseebox.css?v=' . $version . '" />';
         
-        if ($settings->jquerySelect == 'true') {
+        // 根据设置决定如何加载jQuery
+        if ($settings->jquerySelect == 'local') {
+            // 加载本地jQuery
+            $output[] = '<script type="text/javascript" src="' . $pluginUrl . 'js/jquery.min.js?v=' . $version . '"></script>';
+        } elseif ($settings->jquerySelect == 'cdn') {
+            // 加载CDN jQuery
             $jqueryVersion = $settings->jqueryVersion ?: '3.7.1';
             $jqueryUrl = 'https://cdn.bootcdn.net/ajax/libs/jquery/' . $jqueryVersion . '/jquery.min.js';
             $output[] = '<script type="text/javascript" src="' . $jqueryUrl . '"></script>';
         }
+        // 如果选择'none'则不加载jQuery
         
         $output[] = '<script type="text/javascript" src="' . $pluginUrl . 'js/iseebox.js?v=' . $version . '"></script>';
         $output[] = self::getInitScript($settings);
@@ -246,6 +273,8 @@ class iSeeBox_Plugin implements Typecho_Plugin_Interface
         $fadeSpeed = intval($settings->fadeSpeed);
         $imageMaxSize = intval($settings->imageMaxSize);
         $loop = $settings->loop == 'true';
+        $debounceDelay = isset($settings->debounceDelay) ? intval($settings->debounceDelay) : 300;
+        $batchProcessLimit = isset($settings->batchProcessLimit) ? intval($settings->batchProcessLimit) : 50;
         
         $config = array(
             'overlayColor' => $overlayColor,
@@ -278,11 +307,79 @@ PAGECHECK;
 <script type="text/javascript">
 (function() {
     var iseeConfig = {$configJson};
-    var isBound = false;
+    var boundElements = new Set(); // 使用Set跟踪已绑定的元素
     
-    // 快速绑定灯箱
+    // 防抖函数
+    function debounce(func, wait) {
+        let timeout;
+        return function executedFunction(...args) {
+            const later = () => {
+                clearTimeout(timeout);
+                func(...args);
+            };
+            clearTimeout(timeout);
+            timeout = setTimeout(later, wait);
+        };
+    }
+
+    // 节流函数
+    function throttle(func, limit) {
+        let inThrottle;
+        return function() {
+            const args = arguments;
+            const context = this;
+            if (!inThrottle) {
+                func.apply(context, args);
+                inThrottle = true;
+                setTimeout(() => inThrottle = false, limit);
+            }
+        }
+    }
+
+    // 批量处理函数，避免长时间阻塞主线程
+    function batchProcess(items, processFn, batchSize = {$batchProcessLimit}) {
+        if (!items.length) return Promise.resolve();
+        
+        return new Promise((resolve) => {
+            let index = 0;
+            
+            function processBatch() {
+                const endIndex = Math.min(index + batchSize, items.length);
+                
+                for (let i = index; i < endIndex; i++) {
+                    processFn(items[i]);
+                }
+                
+                index = endIndex;
+                
+                if (index < items.length) {
+                    // 使用 requestIdleCallback 或 setTimeout 将下一个批次推迟到下一个事件循环
+                    if (window.requestIdleCallback) {
+                        requestIdleCallback(processBatch);
+                    } else {
+                        setTimeout(processBatch, 0);
+                    }
+                } else {
+                    resolve();
+                }
+            }
+            
+            processBatch();
+        });
+    }
+
+    // 检查元素是否已被绑定
+    function isElementBound(element) {
+        return boundElements.has(element);
+    }
+
+    // 标记元素为已绑定
+    function markAsBound(element) {
+        boundElements.add(element);
+    }
+
+    // 快速绑定灯箱 - 优化版本
     function bindLightbox() {
-        if (isBound) return;
         if (typeof jQuery === 'undefined' || typeof jQuery.fn.iseebox === 'undefined') {
             setTimeout(bindLightbox, 10);
             return;
@@ -295,8 +392,11 @@ PAGECHECK;
             if (autoWrapEnabled) {
                 var excludeSelectors = {$excludeSelectorsJson};
                 
-                $('.entry-content img, .post-content img, .article-content img, .photo-item img, .photo-grid img').each(function() {
-                    var \$img = $(this);
+                var images = $('.entry-content img, .post-content img, .article-content img, .photo-item img, .photo-grid img, .waterfall-grid img');
+                
+                // 批量处理图片包装
+                batchProcess(images, function(img) {
+                    var \$img = $(img);
                     var src = \$img.attr('src') || \$img.attr('data-src') || \$img.attr('data-original');
                     
                     var isExcluded = false;
@@ -318,36 +418,47 @@ PAGECHECK;
                 });
             }
             
-            var selectorStr = "{$selectors}, .isee-auto-link, .photo-item a, .photo-grid a";
+            var selectorStr = "{$selectors}, .isee-auto-link, .photo-item a, .photo-grid a, .waterfall-grid a";
             var \$links = $(selectorStr);
             
             var excludeSelectors = {$excludeSelectorsJson};
             if (excludeSelectors.length > 0) {
-                \$links = \$links.filter(function() {
+                \$links = \$links.not(function() {
                     var \$this = $(this);
                     for (var i = 0; i < excludeSelectors.length; i++) {
                         if (excludeSelectors[i] && (\$this.closest(excludeSelectors[i]).length > 0 || \$this.parents(excludeSelectors[i]).length > 0)) {
-                            return false;
+                            return true;
                         }
                     }
-                    return true;
+                    return false;
                 });
             }
             
-            \$links = \$links.filter(function() {
+            // 过滤掉相册卡片链接
+            \$links = \$links.not(function() {
                 var \$this = $(this);
                 var hasAlbumClass = \$this.hasClass('album-card-link') || 
                                    \$this.closest('.album-card-link').length > 0 ||
                                    \$this.parents('.album-card-link').length > 0;
-                return !hasAlbumClass;
+                return hasAlbumClass;
             });
             
-            if (\$links.length > 0) {
+            // 过滤掉已绑定的元素
+            var unboundLinks = \$links.filter(function() {
+                return !isElementBound(this);
+            });
+            
+            if (unboundLinks.length > 0) {
                 try {
-                    \$links.off('click.isee');
-                    \$links.iseebox(iseeConfig);
-                    isBound = true;
-                    if (window.console) console.log('iSeeBox: 已绑定 ' + \$links.length + ' 个图片');
+                    // 批量绑定灯箱
+                    batchProcess(unboundLinks, function(link) {
+                        var \$link = $(link);
+                        \$link.off('click.isee');
+                        \$link.iseebox(iseeConfig);
+                        markAsBound(link);
+                    });
+                    
+                    if (window.console) console.log('iSeeBox: 新增绑定 ' + unboundLinks.length + ' 个图片');
                 } catch(e) {
                     if (window.console) console.error('iSeeBox 错误:', e);
                 }
@@ -355,145 +466,113 @@ PAGECHECK;
         });
     }
     
-    // 重新绑定（用于新加载的图片，不限制次数）
-    function rebindLightbox() {
-        if (typeof jQuery === 'undefined' || typeof jQuery.fn.iseebox === 'undefined') {
-            setTimeout(rebindLightbox, 10);
-            return;
+    // 防抖后的绑定函数
+    var debouncedBind = debounce(bindLightbox, {$debounceDelay});
+    
+    // 页面加载后立即绑定
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', bindLightbox);
+    } else {
+        bindLightbox();
+    }
+    
+    // 优化的 MutationObserver - 只关注图片相关的变动
+    var observer = null;
+    var initObserver = function() {
+        if (observer) {
+            observer.disconnect();
         }
         
-        jQuery(function($) {
-            {$pageCheck}
+        observer = new MutationObserver(debounce(function(mutations) {
+            var hasImageChanges = false;
             
-            var autoWrapEnabled = {$autoWrapStr};
-            if (autoWrapEnabled) {
-                var excludeSelectors = {$excludeSelectorsJson};
+            for (var i = 0; i < mutations.length; i++) {
+                var mutation = mutations[i];
                 
-                $('.entry-content img, .post-content img, .article-content img, .photo-item img, .photo-grid img').each(function() {
-                    var \$img = $(this);
-                    var src = \$img.attr('src') || \$img.attr('data-src') || \$img.attr('data-original');
-                    
-                    var isExcluded = false;
-                    if (excludeSelectors.length > 0) {
-                        for (var i = 0; i < excludeSelectors.length; i++) {
-                            if (excludeSelectors[i] && \$img.closest(excludeSelectors[i]).length > 0) {
-                                isExcluded = true;
+                if (mutation.type === 'childList') {
+                    // 检查新增节点
+                    for (var j = 0; j < mutation.addedNodes.length; j++) {
+                        var node = mutation.addedNodes[j];
+                        
+                        if (node.nodeType === 1) { // 元素节点
+                            // 检查是否包含图片或链接
+                            if (node.tagName === 'IMG' || 
+                                node.tagName === 'A' && node.querySelector('img') ||
+                                node.querySelector('img') || 
+                                node.querySelector('a:has(img)')) {
+                                hasImageChanges = true;
                                 break;
                             }
                         }
                     }
                     
-                    if (!isExcluded && \$img.parent('a').length === 0 && src) {
-                        if (src.match(/\\.(jpg|jpeg|png|gif|webp|bmp|svg)/i)) {
-                            var imgAlt = \$img.attr('alt') || '';
-                            \$img.wrap('<a href="' + src + '" title="' + imgAlt + '" class="isee-auto-link"></a>');
-                        }
+                    if (hasImageChanges) {
+                        break;
                     }
-                });
-            }
-            
-            var selectorStr = "{$selectors}, .isee-auto-link, .photo-item a, .photo-grid a";
-            var \$links = $(selectorStr);
-            
-            var excludeSelectors = {$excludeSelectorsJson};
-            if (excludeSelectors.length > 0) {
-                \$links = \$links.filter(function() {
-                    var \$this = $(this);
-                    for (var i = 0; i < excludeSelectors.length; i++) {
-                        if (excludeSelectors[i] && (\$this.closest(excludeSelectors[i]).length > 0 || \$this.parents(excludeSelectors[i]).length > 0)) {
-                            return false;
-                        }
-                    }
-                    return true;
-                });
-            }
-            
-            \$links = \$links.filter(function() {
-                var \$this = $(this);
-                var hasAlbumClass = \$this.hasClass('album-card-link') || 
-                                   \$this.closest('.album-card-link').length > 0 ||
-                                   \$this.parents('.album-card-link').length > 0;
-                return !hasAlbumClass;
-            });
-            
-            if (\$links.length > 0) {
-                try {
-                    // 只绑定未绑定的链接
-                    \$links.each(function() {
-                        var \$link = $(this);
-                        if (!\$link.data('isee-bound')) {
-                            \$link.data('isee-bound', true);
-                            \$link.off('click.isee');
-                            \$link.iseebox(iseeConfig);
-                        }
-                    });
-                } catch(e) {
-                    if (window.console) console.error('iSeeBox 绑定错误:', e);
                 }
             }
-        });
-    }
-    
-    // 立即绑定已存在的图片
-    bindLightbox();
-    
-    // 为所有未加载完成的图片添加加载监听
-    var quickBind = function() {
-        rebindLightbox();
+            
+            if (hasImageChanges) {
+                // 延迟执行，确保DOM完全渲染
+                setTimeout(debouncedBind, 100);
+            }
+        }, 200)); // MutationObserver 内部也使用防抖
+        
+        if (document.body) {
+            observer.observe(document.body, { 
+                childList: true, 
+                subtree: true 
+            });
+        } else {
+            document.addEventListener('DOMContentLoaded', function() {
+                observer.observe(document.body, { 
+                    childList: true, 
+                    subtree: true 
+                });
+            });
+        }
     };
     
-    var images = document.querySelectorAll('img');
-    for (var i = 0; i < images.length; i++) {
-        var img = images[i];
-        if (!img.complete) {
-            img.addEventListener('load', quickBind);
-            img.addEventListener('error', quickBind);
-        }
+    // 初始化观察器
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initObserver);
+    } else {
+        initObserver();
     }
     
-    // 监听新添加的图片（MutationObserver - 瀑布流无限加载）
-    var observer = new MutationObserver(function(mutations) {
-        var needRebind = false;
-        for (var i = 0; i < mutations.length; i++) {
-            var mutation = mutations[i];
-            if (mutation.addedNodes.length > 0) {
-                // 检查新增节点中是否包含图片
-                for (var j = 0; j < mutation.addedNodes.length; j++) {
-                    var node = mutation.addedNodes[j];
-                    if (node.nodeType === 1) { // 元素节点
-                        if (node.tagName === 'IMG' || node.querySelectorAll) {
-                            var hasImg = node.tagName === 'IMG' || node.querySelectorAll('img').length > 0;
-                            if (hasImg) {
-                                needRebind = true;
-                                // 为新图片添加加载监听
-                                var newImages = node.tagName === 'IMG' ? [node] : node.querySelectorAll('img');
-                                for (var k = 0; k < newImages.length; k++) {
-                                    var newImg = newImages[k];
-                                    if (!newImg.complete) {
-                                        newImg.addEventListener('load', quickBind);
-                                        newImg.addEventListener('error', quickBind);
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if (needRebind) break;
-        }
-        if (needRebind) {
-            rebindLightbox();
-        }
-    });
+    // 为图片加载事件添加节流处理
+    var handleImageLoad = throttle(function() {
+        debouncedBind();
+    }, 500);
     
-    if (document.body) {
-        observer.observe(document.body, { childList: true, subtree: true });
-    } else {
-        document.addEventListener('DOMContentLoaded', function() {
-            observer.observe(document.body, { childList: true, subtree: true });
+    // 监听图片加载完成事件，使用事件委托
+    document.addEventListener('load', function(e) {
+        if (e.target.tagName === 'IMG') {
+            handleImageLoad();
+        }
+    }, true); // 使用捕获阶段确保能捕获到
+    
+    // 瀑布流可能通过AJAX等方式动态加载，监听页面滚动事件作为备选方案
+    var scrollHandler = throttle(function() {
+        // 只在页面底部附近滚动时检查
+        if ((window.innerHeight + window.scrollY) >= document.body.offsetHeight - 1000) {
+            debouncedBind();
+        }
+    }, 1000); // 滚动事件节流
+    
+    window.addEventListener('scroll', scrollHandler);
+    
+    // 页面显示/隐藏时重新检查
+    if ('hidden' in document) {
+        document.addEventListener('visibilitychange', function() {
+            if (!document.hidden) {
+                setTimeout(debouncedBind, 500);
+            }
         });
     }
+    
+    // 如果页面有 Pjax 或类似功能，提供手动触发接口
+    window.iSeeBoxRefresh = debouncedBind;
     
 })();
 </script>
